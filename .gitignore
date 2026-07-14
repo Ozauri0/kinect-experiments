@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+*.jpg
+*.png
+*.oni
+.env
