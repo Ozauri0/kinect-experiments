@@ -1,0 +1,658 @@
+#!/usr/bin/env python
+"""Avatar 3D rigged controlado por Kinect v1 (Xbox 360).
+
+Pipeline en tiempo real:
+1. libfreenect entrega el stream RGB y el mapa de profundidad en mm.
+2. MediaPipe Pose estima 33 landmarks 2D sobre el RGB.
+3. La profundidad de la Kinect "levanta" cada landmark a 3D (m): con la
+   distancia del pixel se recupera la coordenada real de cada articulacion.
+4. Un retargeting vectorial calcula, hueso a hueso, el cuaternion que lleva
+   la direccion de reposo del rig a la direccion deseada en el espacio del
+   padre (sin resolver IK complejo).
+5. Panda3D renderiza el modelo .bam con las articulaciones controladas.
+
+Uso:
+    .venv/bin/python avatar.py [--debug] [--model models/RobotExpressive_rigged.bam]
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from typing import Optional
+
+import numpy as np
+
+try:
+    import freenect
+except ImportError:
+    freenect = None
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
+W, H = 640, 480
+FX, FY, CX, CY = 525.0, 525.0, 319.5, 239.5
+
+NOSE, L_SHOULDER, R_SHOULDER, L_ELBOW, R_ELBOW, L_WRIST, R_WRIST = range(0, 7)
+L_HIP, R_HIP, L_KNEE, R_KNEE, L_ANKLE, R_ANKLE, L_FOOT, R_FOOT = range(7, 15)
+
+_LM = {
+    "nose": 0,
+    "L_shoulder": 11, "R_shoulder": 12,
+    "L_elbow": 13, "R_elbow": 14,
+    "L_wrist": 15, "R_wrist": 16,
+    "L_hip": 23, "R_hip": 24,
+    "L_knee": 25, "R_knee": 26,
+    "L_ankle": 27, "R_ankle": 28,
+    "L_heel": 29, "R_heel": 30,
+    "L_foot": 31, "R_foot": 32,
+}
+
+# Si el landmark del pie no esta disponible se usa el talon o el tobillo.
+FOOT_FALLBACK = {"L_foot": ("L_heel", "L_ankle"), "R_foot": ("R_heel", "R_ankle")}
+
+# Nombres de huesos del rig (RobotExpressive) y su padre directo.
+JOINT_PARENTS = {
+    "Bone": None,
+    "Body": "Bone",
+    "Hips": "Body",
+    "Abdomen": "Hips",
+    "Torso": "Abdomen",
+    "Neck": "Torso",
+    "Head": "Neck",
+    "Shoulder.L": "Torso",
+    "Shoulder.R": "Torso",
+    "UpperArm.L": "Shoulder.L",
+    "UpperArm.R": "Shoulder.R",
+    "LowerArm.L": "UpperArm.L",
+    "LowerArm.R": "UpperArm.R",
+    "UpperLeg.L": "Body",
+    "UpperLeg.R": "Body",
+    "LowerLeg.L": "UpperLeg.L",
+    "LowerLeg.R": "UpperLeg.R",
+    "Foot.L": "Bone",
+    "Foot.R": "Bone",
+}
+
+# rol -> (joint, punto de inicio, punto final) con puntos del mapa 3D de persona.
+BONE_TARGETS = [
+    ("Hips", "Hips", "pelvis", "chest"),
+    ("Abdomen", "Abdomen", "pelvis", "chest"),
+    ("Torso", "Torso", "pelvis", "chest"),
+    ("Neck", "Neck", "neck", "nose"),
+    ("Head", "Head", "neck", "nose"),
+    ("Shoulder.L", "Shoulder.L", "chest", "L_shoulder"),
+    ("Shoulder.R", "Shoulder.R", "chest", "R_shoulder"),
+    ("UpperArm.L", "UpperArm.L", "L_shoulder", "L_elbow"),
+    ("UpperArm.R", "UpperArm.R", "R_shoulder", "R_elbow"),
+    ("LowerArm.L", "LowerArm.L", "L_elbow", "L_wrist"),
+    ("LowerArm.R", "LowerArm.R", "R_elbow", "R_wrist"),
+    ("UpperLeg.L", "UpperLeg.L", "L_hip", "L_knee"),
+    ("UpperLeg.R", "UpperLeg.R", "R_hip", "R_knee"),
+    ("LowerLeg.L", "LowerLeg.L", "L_knee", "L_ankle"),
+    ("LowerLeg.R", "LowerLeg.R", "R_knee", "R_ankle"),
+    ("Foot.L", "Foot.L", "L_ankle", "L_foot"),
+    ("Foot.R", "Foot.R", "R_ankle", "R_foot"),
+]
+
+
+def quat_from_two_vectors(a, b):
+    """Cuaternion (Panda3D) que rota el vector unitario a hacia b."""
+    from panda3d.core import Quat, Vec3
+
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    a /= np.linalg.norm(a) + 1e-12
+    b /= np.linalg.norm(b) + 1e-12
+    axis = np.cross(a, b)
+    sin_angle = np.linalg.norm(axis)
+    cos_angle = float(np.dot(a, b))
+    if sin_angle < 1e-8:
+        if cos_angle < 0:  # giro de 180 grados: elegir un eje arbitrario
+            fallback = np.array([0.0, 0.0, 1.0])
+            axis = np.cross(a, fallback)
+            if np.linalg.norm(axis) < 1e-8:
+                axis = np.array([1.0, 0.0, 0.0])
+            sin_angle = np.linalg.norm(axis)
+            angle = np.pi
+        else:
+            return Quat(0.0, 0.0, 0.0, 1.0)
+    else:
+        angle = np.arctan2(sin_angle, cos_angle)
+    axis = axis / (sin_angle + 1e-12)
+    q = Quat()
+    q.setFromAxisAngle(float(np.degrees(angle)), Vec3(*axis))
+    return q
+
+
+class KinectSource:
+    """Captura sincrona de profundidad y RGB via libfreenect."""
+
+    def __init__(self, device_index: int = 0):
+        if freenect is None:
+            raise RuntimeError(
+                "No se pudo importar freenect. Instalalo con: "
+                ".venv/bin/python -m pip install freenect (requiere libfreenect nativa)."
+            )
+        self.device_index = device_index
+
+    def read(self):
+        try:
+            depth, _ = freenect.sync_get_depth(index=self.device_index, format=freenect.DEPTH_MM)
+            rgb, _ = freenect.sync_get_video(index=self.device_index)
+        except Exception as exc:
+            raise RuntimeError(f"No se pudo leer la Kinect: {exc}") from exc
+        if depth is None or rgb is None:
+            raise RuntimeError("La Kinect devolvio un frame vacio.")
+        return np.asarray(depth, dtype=np.uint16), np.asarray(rgb, dtype=np.uint8)
+
+
+class PoseEstimator:
+    """MediaPipe Pose (33 landmarks) sobre RGB."""
+
+    def __init__(self, task_path: str):
+        import mediapipe as mp
+        from mediapipe.tasks import python as mp_python
+        from mediapipe.tasks.python import vision
+
+        options = vision.PoseLandmarkerOptions(
+            base_options=mp_python.BaseOptions(model_asset_path=task_path),
+            running_mode=vision.RunningMode.VIDEO,
+            num_poses=1,
+        )
+        self.landmarker = vision.PoseLandmarker.create_from_options(options)
+        self.mp_image = mp.Image
+        self.image_format = mp.ImageFormat.SRGB
+        self._last_ts = -1
+
+    def process(self, rgb: np.ndarray, timestamp_ms: int):
+        if timestamp_ms <= self._last_ts:
+            timestamp_ms = self._last_ts + 1
+        self._last_ts = timestamp_ms
+        image = self.mp_image(image_format=self.image_format,
+                              data=np.ascontiguousarray(rgb))
+        result = self.landmarker.detect_for_video(image, timestamp_ms)
+        if not result.pose_landmarks:
+            return None
+        lm = result.pose_landmarks[0]
+        return np.array([[p.x, p.y, p.z, p.visibility] for p in lm], dtype=np.float32)
+
+
+def sample_depth_at(depth: np.ndarray, x: float, y: float, windows=(7, 15)) -> Optional[float]:
+    """Mediana de profundidad valida alrededor de un landmark (robusto a ruido).
+
+    Si la ventana pequena no contiene suficientes muestras validas (huecos del
+    sensor), se intenta una ventana mayor antes de declarar el punto perdido.
+    """
+    px = int(np.clip(round(x * W), 0, W - 1))
+    py = int(np.clip(round(y * H), 0, H - 1))
+    for window in windows:
+        half = window // 2
+        x0, x1 = max(px - half, 0), min(px + half + 1, W)
+        y0, y1 = max(py - half, 0), min(py + half + 1, H)
+        region = depth[y0:y1, x0:x1]
+        valid = region[region > 0]
+        if valid.size >= 4:
+            return float(np.median(valid))
+    return None
+
+
+def landmarks_to_3d(landmarks: np.ndarray, depth: np.ndarray, mirror: bool) -> Optional[dict]:
+    """Convierte landmarks 2D + profundidad en posiciones 3D relativas a la pelvis.
+
+    Espacio de persona (metros): x = derecha, y = arriba, z = hacia la camara.
+
+    Enfoque hibrido: la profundidad absoluta se toma solo del torso (donde el
+    muestreo píxel a píxel es robusto pese al desalineado RGB/profundidad) y la
+    profundidad relativa de MediaPipe (landmark.z, escala ~ anchura del torso)
+    desplaza cada extremidad hacia delante/atras. Asi las articulaciones
+    mantienen su posicion lateral correcta aunque el pixel exacto de la
+    extremidad no tenga profundidad valida.
+    """
+    samples = []
+    for key in ("L_hip", "R_hip", "L_shoulder", "R_shoulder"):
+        idx = _LM[key]
+        sample = sample_depth_at(depth, landmarks[idx, 0], landmarks[idx, 1])
+        if sample is not None:
+            samples.append(sample)
+    if not samples:
+        return None
+    z0 = float(np.median(samples)) / 1000.0
+
+    # Anchura del torso en metros (sirve de escala para la z relativa).
+    lx = (landmarks[_LM["L_hip"], 0] * W - CX) * z0 / FX
+    rx = (landmarks[_LM["R_hip"], 0] * W - CX) * z0 / FX
+    torso_width = max(abs(lx - rx), 0.2)
+
+    points: dict[str, np.ndarray] = {}
+    for key, idx in _LM.items():
+        x, y, z_rel, visibility = landmarks[idx, 0], landmarks[idx, 1], landmarks[idx, 2], landmarks[idx, 3]
+        if visibility < 0.05:
+            continue
+        z = max(z0 + float(z_rel) * torso_width, 0.3)
+        world_x = (x * W - CX) * z / FX
+        world_y = (y * H - CY) * z / FY
+        points[key] = np.array([world_x, -world_y, -z], dtype=np.float64)  # x=der, y=arriba, z=hacia camara
+
+    for foot, (heel, ankle) in FOOT_FALLBACK.items():
+        if foot not in points:
+            if heel in points:
+                points[foot] = points[heel].copy()
+            elif ankle in points:
+                points[foot] = points[ankle].copy()
+
+    if mirror:
+        for key in list(points):
+            points[key][0] = -points[key][0]
+
+    # Núcleo mínimo imprescindible para retargeting.
+    for needed in ("L_hip", "R_hip", "L_shoulder", "R_shoulder"):
+        if needed not in points:
+            return None
+
+    pelvis = (points["L_hip"] + points["R_hip"]) / 2.0
+    for key in points:
+        points[key] -= pelvis
+    points["pelvis"] = np.zeros(3)
+    points["chest"] = (points["L_shoulder"] + points["R_shoulder"]) / 2.0
+    points["neck"] = points["chest"]
+    return points
+
+
+def diagnose_3d(landmarks: np.ndarray, depth: np.ndarray) -> str:
+    """Explica por que el levantamiento 3D fallo (para el texto de estado)."""
+    problems = []
+    samples = []
+    for key in ("L_hip", "R_hip", "L_shoulder", "R_shoulder"):
+        idx = _LM[key]
+        vis = landmarks[idx, 3]
+        z_mm = sample_depth_at(depth, landmarks[idx, 0], landmarks[idx, 1])
+        if vis < 0.05:
+            problems.append(f"{key}:vis={vis:.2f}")
+        elif z_mm is not None:
+            samples.append(z_mm)
+    if not samples and not problems:
+        problems.append("sin profundidad en torso")
+    return " | ".join(problems[:4]) if problems else ""
+
+
+class SkeletonDriver:
+    """Retargeting vectorial de esqueleto humano a rig del modelo."""
+
+    def __init__(self, actor, model_root_name: str = "modelRoot", display_height: float = 1.8):
+        from panda3d.core import Quat, Vec3
+
+        self.actor = actor
+        self.Quat = Quat
+        self.controls: dict[str, object] = {}
+        self.bind_local: dict[str, tuple] = {}
+        self.world_bind: dict[str, np.ndarray] = {}
+        self.world_quats: dict[str, Quat] = {}
+        self.last_valid: Optional[dict] = None
+        self.display_height = display_height
+        self.scale = 1.0
+        self.person_scale = 1.0
+        self.smoothed: Optional[dict] = None
+
+        for name in JOINT_PARENTS:
+            ctrl = actor.controlJoint(None, model_root_name, name)
+            self.controls[name] = ctrl
+            state = ctrl.getTransform()
+            self.bind_local[name] = (Vec3(*state.getPos()), state.getQuat())
+
+        # Matriz de bind mundial de cada hueso (composicion de la jerarquia).
+        for name in JOINT_PARENTS:
+            parent = JOINT_PARENTS[name]
+            local = self.bind_local[name][0]
+            if parent is None:
+                self.world_bind[name] = np.array([local[0], local[1], local[2]])
+            else:
+                self.world_bind[name] = self.world_bind[parent] + np.array([local[0], local[1], local[2]])
+
+        head = self.world_bind["Head"]
+        feet = (self.world_bind["Foot.L"] + self.world_bind["Foot.R"]) / 2.0
+        self.model_height = max(float(np.linalg.norm(head - feet)), 1e-3)
+
+        # El .glb viene en unidades diminutas; se escala el Actor a tamano real.
+        self.actor_scale = self.display_height / self.model_height
+        actor.setScale(self.actor_scale)
+
+    def _rest_local_dir(self, name: str):
+        pos, _ = self.bind_local[name]
+        length = pos.length()
+        if length < 1e-6:
+            return np.array([0.0, 0.0, 1.0])
+        return np.array([pos[0], pos[1], pos[2]]) / length
+
+    def update(self, person: dict, person_height: Optional[float] = None) -> None:
+        from panda3d.core import Vec3
+
+        # Suavizado exponencial de las posiciones 3D (reduce jitter sin latencia).
+        # Solo se mezclan los landmarks presentes en el frame actual.
+        alpha = 0.35
+        if self.smoothed is None:
+            self.smoothed = {}
+        for key, value in person.items():
+            if key in self.smoothed:
+                self.smoothed[key] = self.smoothed[key] * (1 - alpha) + value * alpha
+            else:
+                self.smoothed[key] = value.copy()
+
+        self.last_valid = person
+        if person_height is None or person_height < 0.5:
+            person_height = 1.7
+        # Escala de posiciones en unidades locales del Actor (que aplica
+        # actor_scale ~ 60x a nivel mundial). Las direcciones (cuaterniones)
+        # son invariantes a la escala uniforme.
+        self.person_scale = self.display_height / person_height
+        self.scale = self.model_height / person_height
+
+        to_avatar = lambda p: Vec3(p[0] * self.scale, p[2] * self.scale, p[1] * self.scale)
+
+        # Raiz del esqueleto: pelvis levantada para que los pies toquen el suelo.
+        ankles = [person.get("L_ankle"), person.get("R_ankle")]
+        ankles = [a for a in ankles if a is not None]
+        if ankles:
+            hip_height = float(person["pelvis"][1] - min(a[1] for a in ankles))
+        else:
+            hip_height = 0.95
+        root_pos = to_avatar(self.smoothed["pelvis"]) + Vec3(0.0, 0.0, hip_height * self.scale)
+        self.controls["Bone"].setPos(root_pos)
+        self.world_quats["Bone"] = self.Quat(0.0, 0.0, 0.0, 1.0)
+        for name, parent in JOINT_PARENTS.items():
+            if parent is None:
+                continue
+            self.world_quats[name] = self.world_quats[parent]
+
+        for role, joint, start_key, end_key in BONE_TARGETS:
+            # Si un extremo del hueso no esta en el frame actual, se congela
+            # su orientacion actual en lugar de usar datos obsoletos.
+            if start_key not in person or end_key not in person:
+                continue
+            start = to_avatar(self.smoothed[start_key])
+            end = to_avatar(self.smoothed[end_key])
+            desired = np.array([end.getX() - start.getX(),
+                                end.getY() - start.getY(),
+                                end.getZ() - start.getZ()])
+            if np.linalg.norm(desired) < 1e-6:
+                continue
+            desired /= np.linalg.norm(desired)
+
+            parent = JOINT_PARENTS[joint]
+            parent_quat = self.world_quats.get(parent, self.Quat(0.0, 0.0, 0.0, 1.0))
+            local_desired = parent_quat.conjugate().xform(Vec3(*desired))
+            q_local = quat_from_two_vectors(self._rest_local_dir(joint), local_desired)
+            self.controls[joint].setQuat(q_local)
+            self.world_quats[joint] = parent_quat * q_local
+
+
+class CaptureThread:
+    """Hilo de captura desacoplado: si el USB se bloquea, la UI no se congela."""
+
+    def __init__(self, kinect: "KinectSource"):
+        import threading
+
+        self.kinect = kinect
+        self.lock = threading.Lock()
+        self.latest = None
+        self.sequence = 0
+        self.error = None
+        self.running = True
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+
+    def _loop(self):
+        while self.running:
+            try:
+                frame = self.kinect.read()
+                with self.lock:
+                    self.latest = frame
+                    self.sequence += 1
+                    self.error = None
+            except RuntimeError as exc:
+                with self.lock:
+                    self.error = str(exc)
+
+    def get_latest(self):
+        with self.lock:
+            return self.latest, self.sequence, self.error
+
+
+def build_scene(base, model_path: str):
+    """Carga el modelo, monta luces, suelo y camara; devuelve (actor, driver)."""
+    from direct.actor.Actor import Actor
+    from panda3d.core import (AmbientLight, CardMaker, DirectionalLight, LineSegs, Vec3, Vec4)
+
+    actor = Actor(base.loader.loadModel(model_path))
+    actor.reparentTo(base.render)
+
+    ambient = AmbientLight("ambient")
+    ambient.setColor((0.7, 0.7, 0.75, 1))
+    base.render.setLight(base.render.attachNewNode(ambient))
+
+    sun = DirectionalLight("sun")
+    sun.setColor((1.0, 1.0, 1.0, 1))
+    sun_np = base.render.attachNewNode(sun)
+    sun_np.setHpr(20, -35, 0)
+    base.render.setLight(sun_np)
+
+    fill = DirectionalLight("fill")
+    fill.setColor((0.5, 0.5, 0.6, 1))
+    fill_np = base.render.attachNewNode(fill)
+    fill_np.setHpr(-160, 10, 0)
+    base.render.setLight(fill_np)
+
+    base.setBackgroundColor(0.07, 0.08, 0.12)
+
+    floor = base.render.attachNewNode(CardMaker("floor").generate())
+    floor.setScale(20)
+    floor.setPos(0, 2, -0.001)
+    floor.setR(90)
+    floor.setColor(0.12, 0.14, 0.18, 1)
+
+    grid = LineSegs("grid")
+    grid.setColor(0.25, 0.28, 0.35, 1)
+    for i in range(-10, 11):
+        grid.moveTo(i, -8, 0)
+        grid.drawTo(i, 12, 0)
+        grid.moveTo(-10, i, 0)
+        grid.drawTo(10, i, 0)
+    base.render.attachNewNode(grid.create())
+
+    base.cam.setPos(0, -2.8, 1.75)
+    base.cam.lookAt(0, 0.2, 1.05)
+    base.disableMouse()
+
+    driver = SkeletonDriver(actor)
+    return actor, driver
+
+
+def draw_debug(frame: np.ndarray, landmarks: np.ndarray, person: Optional[dict]) -> np.ndarray:
+    """Ventana OpenCV auxiliar con esqueleto y profundidad (solo con --debug)."""
+    if frame is None:
+        return
+    out = frame.copy()
+    pairs = [(11, 12), (12, 14), (14, 16), (11, 13), (13, 15), (23, 24),
+             (24, 26), (26, 28), (23, 25), (25, 27), (11, 23), (12, 24), (0, 11), (0, 12)]
+    for a, b in pairs:
+        pa = (int(landmarks[a, 0] * W), int(landmarks[a, 1] * H))
+        pb = (int(landmarks[b, 0] * W), int(landmarks[b, 1] * H))
+        cv2.line(out, pa, pb, (80, 220, 120), 2)
+    cv2.putText(out, "DEBUG: pose Kinect + profundidad", (12, 24),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 255, 220), 1, cv2.LINE_AA)
+    return out
+
+
+def make_test_person(t: float) -> dict:
+    """Pose sintetica de prueba: saluda con el brazo izquierdo."""
+    wave = float(np.sin(t * 3.0))
+    return {
+        "pelvis": np.zeros(3),
+        "chest": np.array([0.0, 0.35, 0.05]),
+        "neck": np.array([0.0, 0.48, 0.05]),
+        "nose": np.array([0.0, 0.58, 0.1]),
+        "L_shoulder": np.array([-0.18, 0.34, 0.05]),
+        "R_shoulder": np.array([0.18, 0.34, 0.05]),
+        "L_elbow": np.array([-0.3, 0.45, 0.15]),
+        "R_elbow": np.array([0.3, 0.2, 0.0]),
+        "L_wrist": np.array([-0.42, 0.55 + 0.25 * wave, 0.25]),
+        "R_wrist": np.array([0.38, 0.1, 0.0]),
+        "L_hip": np.array([-0.1, -0.02, 0.0]),
+        "R_hip": np.array([0.1, -0.02, 0.0]),
+        "L_knee": np.array([-0.12, -0.5, 0.02]),
+        "R_knee": np.array([0.12, -0.5, 0.02]),
+        "L_ankle": np.array([-0.12, -0.95, 0.03]),
+        "R_ankle": np.array([0.12, -0.95, 0.03]),
+        "L_foot": np.array([-0.12, -0.97, 0.15]),
+        "R_foot": np.array([0.12, -0.97, 0.15]),
+    }
+
+
+def run(args) -> int:
+    if cv2 is None:
+        print("OpenCV no esta disponible.", file=sys.stderr)
+        return 1
+
+    from panda3d.core import loadPrcFileData
+    loadPrcFileData("", "window-title Avatar Kinect v1 - Lluvia Digital Interactiva")
+    from direct.showbase.ShowBase import ShowBase
+    from panda3d.core import TextNode, Vec4
+
+    try:
+        kinect = KinectSource(args.device)
+    except RuntimeError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+    estimator = PoseEstimator(args.task)
+
+    base = ShowBase()
+    base.win.setClearColorActive(True)
+    base.win.setClearColor(Vec4(0.07, 0.08, 0.12, 1))
+
+    capture = CaptureThread(kinect)
+    capture.start()
+
+    try:
+        actor, driver = build_scene(base, args.model)
+    except Exception as exc:
+        print(f"No se pudo cargar el modelo {args.model}: {exc}", file=sys.stderr)
+        print("Convierte el glb con: .venv/bin/gltf2bam models/RobotExpressive_rigged.glb models/RobotExpressive_rigged.bam",
+              file=sys.stderr)
+        base.destroy()
+        return 1
+
+    hint = TextNode("hint")
+    hint.setText("Kinect v1 -> MediaPipe Pose -> retarget vectorial -> Panda3D | T: pose de prueba")
+    hint.setAlign(TextNode.ACenter)
+    hint.setTextColor(0.75, 0.8, 0.9, 1)
+    hint_np = base.aspect2d.attachNewNode(hint)
+    hint_np.setScale(0.055)
+    hint_np.setPos(0, 0, 0.88)
+
+    status = TextNode("status")
+    status.setAlign(TextNode.ACenter)
+    status.setTextColor(0.9, 0.55, 0.5, 1)
+    status_np = base.aspect2d.attachNewNode(status)
+    status_np.setScale(0.045)
+    status_np.setPos(0, 0, -0.9)
+
+    state = {"frames": 0, "failures": 0, "start": time.perf_counter(), "last_valid": None,
+             "last_seq": 0, "test_frames": 0}
+
+    def start_test_pose():
+        state["test_frames"] = 240
+
+    base.accept("t", start_test_pose)
+
+    def update(task):
+        if state["test_frames"] > 0:
+            state["test_frames"] -= 1
+            driver.update(make_test_person(240 - state["test_frames"]))
+            status.setText("POSE DE PRUEBA: el robot saluda con el brazo izquierdo...")
+            if state["test_frames"] == 0:
+                driver.smoothed = None
+            return task.cont
+
+        frame, seq, error = capture.get_latest()
+        if frame is None:
+            if error:
+                state["failures"] += 1
+                if state["failures"] < 60:
+                    status.setText(f"Kinect: {error}")
+            else:
+                status.setText("Esperando frames de la Kinect...")
+            return task.cont
+
+        # Cada frame capturado se procesa una sola vez, aunque el bucle de
+        # render vaya mas rapido que la camara.
+        if seq == state["last_seq"]:
+            return task.cont
+        state["last_seq"] = seq
+
+        depth, rgb = frame
+        ts_ms = int(time.monotonic_ns() // 1_000_000)
+        landmarks = estimator.process(rgb, ts_ms)
+
+        person = None
+        if landmarks is not None:
+            person = landmarks_to_3d(landmarks, depth, args.mirror)
+        if person is None:
+            reason = diagnose_3d(landmarks, depth) if landmarks is not None else "sin pose 2D"
+            status.setText(f"No se detecta persona 3D ({reason}). Colocate de pie a 1.5-3 m.")
+            if args.debug:
+                cv2.imshow("Kinect debug", draw_debug(rgb, landmarks, person) if landmarks is not None else rgb)
+                if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                    base.userExit()
+                    return task.done
+            return task.cont
+
+        state["last_valid"] = person
+        driver.update(person)
+        state["frames"] += 1
+        elapsed = max(time.perf_counter() - state["start"], 1e-6)
+        fps = state["frames"] / elapsed
+        status.setText(f"{fps:.0f} FPS | persona detectada | altura {1.0 / driver.person_scale:.2f} m")
+
+        if args.debug and landmarks is not None:
+            cv2.imshow("Kinect debug", draw_debug(rgb, landmarks, person))
+            if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                base.userExit()
+                return task.done
+
+        return task.cont
+
+    base.taskMgr.add(update, "kinect-update")
+    base.run()
+
+    capture.stop()
+    estimator.landmarker.close()
+    if args.debug:
+        cv2.destroyAllWindows()
+    return 0
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--device", type=int, default=0, help="Indice de Kinect libfreenect")
+    parser.add_argument("--model", default="models/RobotExpressive_rigged.bam",
+                        help="Modelo .bam con rig (convertido con gltf2bam)")
+    parser.add_argument("--task", default="models/pose_landmarker_lite.task",
+                        help="Modelo .task de MediaPipe Pose")
+    parser.add_argument("--mirror", action=argparse.BooleanOptionalAction, default=True,
+                        help="Modo espejo (por defecto activado)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Abre una ventana OpenCV auxiliar con el esqueleto 2D")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    raise SystemExit(run(parse_args()))

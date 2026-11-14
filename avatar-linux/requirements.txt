@@ -1,0 +1,8 @@
+# Dependencias Python (entorno virtual). libfreenect se instala por separado:
+# Arch/CachyOS: AUR (libfreenect) o compilacion nativa, ver README.md.
+numpy>=1.24
+opencv-python>=4.8
+mediapipe>=1.0
+panda3d>=1.10.16
+# Solo necesario para convertir .glb a .bam con gltf2bam:
+panda3d-gltf>=1.3
